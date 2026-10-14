@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
@@ -15,26 +16,85 @@ from llm.protocols.common import (
     parse_usage_tokens,
     raise_from_http_body,
 )
-from llm.types import ChatRequest, ChatResponse, Message, StreamChunk
+from llm.protocols.tool_helpers import (
+    arguments_to_wire_string,
+    build_tool_call,
+    normalize_tool_calls,
+    resolve_finish_reason,
+)
+from llm.types import ChatRequest, ChatResponse, Message, StreamChunk, ToolCall
 
 
-def _split_system(messages: list[Message]) -> tuple[str | None, list[dict[str, str]]]:
+def _split_system_and_messages(
+    messages: list[Message],
+) -> tuple[str | None, list[dict[str, Any]]]:
     system_parts: list[str] = []
-    converted: list[dict[str, str]] = []
+    converted: list[dict[str, Any]] = []
+    pending_tool_results: list[dict[str, Any]] = []
+
+    def flush_tool_results() -> None:
+        nonlocal pending_tool_results
+        if pending_tool_results:
+            converted.append({"role": "user", "content": pending_tool_results})
+            pending_tool_results = []
+
     for msg in messages:
         if msg.role == "system":
-            system_parts.append(msg.content)
-        else:
-            converted.append({"role": msg.role, "content": msg.content})
+            flush_tool_results()
+            system_parts.append(msg.content or "")
+            continue
+        if msg.role == "tool":
+            pending_tool_results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": msg.tool_call_id,
+                    "content": msg.content if msg.content is not None else "",
+                }
+            )
+            continue
+        flush_tool_results()
+        if msg.role == "assistant" and msg.tool_calls:
+            blocks: list[dict[str, Any]] = []
+            if msg.content:
+                blocks.append({"type": "text", "text": msg.content})
+            for call in msg.tool_calls:
+                if call.arguments is not None:
+                    parsed: dict[str, Any] = call.arguments
+                else:
+                    try:
+                        value = json.loads(arguments_to_wire_string(call) or "{}")
+                    except json.JSONDecodeError:
+                        value = {}
+                    parsed = value if isinstance(value, dict) else {}
+                blocks.append(
+                    {
+                        "type": "tool_use",
+                        "id": call.id,
+                        "name": call.name,
+                        "input": parsed,
+                    }
+                )
+            converted.append({"role": "assistant", "content": blocks})
+            continue
+        converted.append(
+            {
+                "role": msg.role,
+                "content": msg.content if msg.content is not None else "",
+            }
+        )
+    flush_tool_results()
     system = "\n\n".join(system_parts) if system_parts else None
     return system, converted
 
 
-def _extract_content_blocks(content: Any) -> tuple[str, str | None]:
+def _extract_content_and_tools(
+    content: Any,
+) -> tuple[str, str | None, list[ToolCall] | None]:
     if isinstance(content, str):
-        return content, None
+        return content, None, None
     texts: list[str] = []
     reasoning: list[str] = []
+    calls: list[ToolCall] = []
     if isinstance(content, list):
         for block in content:
             if not isinstance(block, dict):
@@ -46,7 +106,31 @@ def _extract_content_blocks(content: Any) -> tuple[str, str | None]:
                 thinking = block.get("thinking") or block.get("data") or ""
                 if thinking:
                     reasoning.append(str(thinking))
-    return "".join(texts), ("".join(reasoning) or None)
+            elif btype == "tool_use":
+                inp = block.get("input")
+                if isinstance(inp, dict):
+                    arguments_raw = json.dumps(
+                        inp, ensure_ascii=False, separators=(",", ":")
+                    )
+                    call = build_tool_call(
+                        id=str(block.get("id") or ""),
+                        name=str(block.get("name") or ""),
+                        arguments_raw=arguments_raw,
+                    )
+                    call.arguments = inp
+                    call.arguments_parse_error = None
+                else:
+                    call = build_tool_call(
+                        id=str(block.get("id") or ""),
+                        name=str(block.get("name") or ""),
+                        arguments_raw=str(inp) if inp is not None else "",
+                    )
+                calls.append(call)
+    return (
+        "".join(texts),
+        ("".join(reasoning) or None),
+        normalize_tool_calls(calls),
+    )
 
 
 class AnthropicMessagesAdapter(ProtocolAdapter):
@@ -66,7 +150,7 @@ class AnthropicMessagesAdapter(ProtocolAdapter):
         return join_url(base, "/v1/messages")
 
     def _build_body(self, request: ChatRequest, *, stream: bool) -> dict[str, Any]:
-        system, messages = _split_system(request.messages)
+        system, messages = _split_system_and_messages(request.messages)
         body: dict[str, Any] = {
             "model": self.config.name,
             "messages": messages,
@@ -81,14 +165,34 @@ class AnthropicMessagesAdapter(ProtocolAdapter):
             body["temperature"] = request.temperature
         if request.stop is not None:
             body["stop_sequences"] = request.stop
+        if request.tools:
+            body["tools"] = [
+                {
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.parameters,
+                }
+                for t in request.tools
+            ]
+            if request.tool_choice == "auto":
+                body["tool_choice"] = {"type": "auto"}
+            elif request.tool_choice == "none":
+                body["tool_choice"] = {"type": "none"}
+            elif request.tool_choice == "required":
+                body["tool_choice"] = {"type": "any"}
+            # null choice: omit
+        # no effective tools: omit tools and tool_choice (validated upstream)
         return body
 
     def _parse_response(self, data: dict[str, Any]) -> ChatResponse:
-        content, reasoning = _extract_content_blocks(data.get("content"))
+        content, reasoning, tool_calls = _extract_content_and_tools(data.get("content"))
+        finish = map_finish_reason(data.get("stop_reason"))
+        finish = resolve_finish_reason(finish, tool_calls)
         return ChatResponse(
             content=content,
             reasoning=reasoning,
-            finish_reason=map_finish_reason(data.get("stop_reason")),
+            tool_calls=tool_calls,
+            finish_reason=finish,
             model=data.get("model") or self.config.name,
             usage=parse_usage_tokens(data.get("usage")),
         )
@@ -129,9 +233,10 @@ class AnthropicMessagesAdapter(ProtocolAdapter):
         last_model: str | None = None
         last_usage = None
         last_finish = None
-        # Anthropic SSE includes event: lines; we only get data: from iter_sse_data_lines
-        # Track block type via content_block_start
-        current_block_type: str | None = None
+        # index -> aggregation state for tool_use blocks
+        blocks: dict[int, dict[str, Any]] = {}
+        current_index: int | None = None
+        stream_aborted = False
         try:
             for data_line in iter_sse_data_lines(lines):
                 payload = parse_json_object(data_line)
@@ -145,39 +250,67 @@ class AnthropicMessagesAdapter(ProtocolAdapter):
                     if usage:
                         last_usage = usage
                 elif event_type == "content_block_start":
+                    index = int(payload.get("index") or 0)
+                    current_index = index
                     block = payload.get("content_block") or {}
-                    current_block_type = block.get("type")
-                    if current_block_type == "thinking" and block.get("thinking"):
+                    btype = block.get("type")
+                    if btype == "thinking" and block.get("thinking"):
                         yield StreamChunk(
                             type="reasoning", delta=str(block["thinking"])
                         )
-                    if current_block_type == "text" and block.get("text"):
+                    if btype == "text" and block.get("text"):
                         yield StreamChunk(type="content", delta=str(block["text"]))
+                    if btype == "tool_use":
+                        blocks[index] = {
+                            "id": str(block.get("id") or ""),
+                            "name": str(block.get("name") or ""),
+                            "arguments": "",
+                            "stopped": False,
+                        }
                 elif event_type == "content_block_delta":
+                    index = int(
+                        payload["index"]
+                        if payload.get("index") is not None
+                        else (current_index or 0)
+                    )
                     delta = payload.get("delta") or {}
                     dtype = delta.get("type")
-                    if dtype == "thinking_delta" or current_block_type == "thinking":
+                    if dtype == "thinking_delta":
                         text = delta.get("thinking") or delta.get("text")
                         if text:
                             yield StreamChunk(type="reasoning", delta=str(text))
-                    elif dtype == "text_delta" or current_block_type == "text":
+                    elif dtype == "text_delta":
                         text = delta.get("text")
                         if text:
                             yield StreamChunk(type="content", delta=str(text))
+                    elif dtype == "input_json_delta":
+                        partial = delta.get("partial_json")
+                        if partial is None:
+                            partial = delta.get("text") or ""
+                        slot = blocks.get(index)
+                        if slot is not None:
+                            slot["arguments"] += str(partial)
                 elif event_type == "content_block_stop":
-                    current_block_type = None
+                    index = int(
+                        payload["index"]
+                        if payload.get("index") is not None
+                        else (current_index or 0)
+                    )
+                    if index in blocks:
+                        blocks[index]["stopped"] = True
+                    current_index = None
                 elif event_type == "message_delta":
                     delta = payload.get("delta") or {}
                     last_finish = map_finish_reason(delta.get("stop_reason"))
                     usage = parse_usage_tokens(payload.get("usage"))
                     if usage:
-                        # Anthropic message_delta usage often only has output_tokens
                         if last_usage and usage.input_tokens is None:
                             usage.input_tokens = last_usage.input_tokens
                         last_usage = usage
                 elif event_type == "message_stop":
                     pass
                 elif event_type == "error":
+                    stream_aborted = True
                     err = payload.get("error") or {}
                     raise LLMError(
                         type="stream_error",
@@ -186,13 +319,35 @@ class AnthropicMessagesAdapter(ProtocolAdapter):
                         retryable=None,
                     )
 
-            yield StreamChunk(
-                type="finish",
-                delta="",
-                finish_reason=last_finish,
-                model=last_model or self.config.name,
-                usage=last_usage,
-            )
+            tool_calls: list[ToolCall] | None = None
+            if blocks:
+                calls: list[ToolCall] = []
+                for index in sorted(blocks):
+                    slot = blocks[index]
+                    truncated = (not slot["stopped"]) or (
+                        last_finish == "length" and not slot["stopped"]
+                    )
+                    if not slot["stopped"]:
+                        truncated = True
+                    calls.append(
+                        build_tool_call(
+                            id=slot["id"],
+                            name=slot["name"],
+                            arguments_raw=slot["arguments"],
+                            truncated=truncated,
+                        )
+                    )
+                tool_calls = normalize_tool_calls(calls)
+            last_finish = resolve_finish_reason(last_finish, tool_calls)
+            if not stream_aborted:
+                yield StreamChunk(
+                    type="finish",
+                    delta="",
+                    finish_reason=last_finish,
+                    model=last_model or self.config.name,
+                    usage=last_usage,
+                    tool_calls=tool_calls,
+                )
         except LLMError:
             raise
         except Exception as exc:  # noqa: BLE001

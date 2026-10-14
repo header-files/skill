@@ -12,6 +12,7 @@ ErrorType = Literal[
     "network_error",
     "stream_error",
     "unsupported_parameter",
+    "invalid_request",
 ]
 
 

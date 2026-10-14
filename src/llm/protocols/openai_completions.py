@@ -15,7 +15,75 @@ from llm.protocols.common import (
     parse_usage_openai_chat,
     raise_from_http_body,
 )
-from llm.types import ChatRequest, ChatResponse, StreamChunk
+from llm.protocols.tool_helpers import (
+    arguments_to_wire_string,
+    build_tool_call,
+    normalize_tool_calls,
+    resolve_finish_reason,
+)
+from llm.types import ChatRequest, ChatResponse, Message, StreamChunk, ToolCall
+
+
+def _encode_messages(messages: list[Message]) -> list[dict[str, Any]]:
+    encoded: list[dict[str, Any]] = []
+    for msg in messages:
+        if msg.role == "tool":
+            item: dict[str, Any] = {
+                "role": "tool",
+                "tool_call_id": msg.tool_call_id,
+                "content": msg.content if msg.content is not None else "",
+            }
+            if msg.name:
+                item["name"] = msg.name
+            encoded.append(item)
+            continue
+        if msg.role == "assistant" and msg.tool_calls:
+            item = {
+                "role": "assistant",
+                "content": msg.content,
+                "tool_calls": [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": arguments_to_wire_string(call),
+                        },
+                    }
+                    for call in msg.tool_calls
+                ],
+            }
+            encoded.append(item)
+            continue
+        encoded.append(
+            {
+                "role": msg.role,
+                "content": msg.content if msg.content is not None else "",
+            }
+        )
+    return encoded
+
+
+def _parse_tool_calls_from_message(message: dict[str, Any]) -> list[ToolCall] | None:
+    raw_calls = message.get("tool_calls") or []
+    if not raw_calls:
+        return None
+    calls: list[ToolCall] = []
+    for item in raw_calls:
+        if not isinstance(item, dict):
+            continue
+        fn = item.get("function") or {}
+        cid = str(item.get("id") or "")
+        name = str(fn.get("name") or "")
+        arguments_raw = fn.get("arguments")
+        if arguments_raw is None:
+            arguments_raw = ""
+        elif not isinstance(arguments_raw, str):
+            arguments_raw = str(arguments_raw)
+        calls.append(
+            build_tool_call(id=cid, name=name, arguments_raw=arguments_raw)
+        )
+    return normalize_tool_calls(calls)
 
 
 class OpenAICompletionsAdapter(ProtocolAdapter):
@@ -34,9 +102,7 @@ class OpenAICompletionsAdapter(ProtocolAdapter):
     def _build_body(self, request: ChatRequest, *, stream: bool) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": self.config.name,
-            "messages": [
-                {"role": m.role, "content": m.content} for m in request.messages
-            ],
+            "messages": _encode_messages(request.messages),
             "stream": stream,
         }
         if request.temperature is not None:
@@ -45,6 +111,20 @@ class OpenAICompletionsAdapter(ProtocolAdapter):
             body["max_tokens"] = request.max_output_tokens
         if request.stop is not None:
             body["stop"] = request.stop
+        if request.tools:
+            body["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                    },
+                }
+                for t in request.tools
+            ]
+            if request.tool_choice is not None:
+                body["tool_choice"] = request.tool_choice
         if stream:
             body["stream_options"] = {"include_usage": True}
         return body
@@ -54,17 +134,24 @@ class OpenAICompletionsAdapter(ProtocolAdapter):
         content = ""
         reasoning: str | None = None
         finish_reason = None
+        tool_calls: list[ToolCall] | None = None
         if choices:
             choice = choices[0]
             message = choice.get("message") or {}
-            content = message.get("content") or ""
+            raw_content = message.get("content")
+            content = "" if raw_content is None else (
+                raw_content if isinstance(raw_content, str) else str(raw_content)
+            )
             reasoning = message.get("reasoning_content") or message.get("reasoning")
             if reasoning is not None:
                 reasoning = str(reasoning)
+            tool_calls = _parse_tool_calls_from_message(message)
             finish_reason = map_finish_reason(choice.get("finish_reason"))
+            finish_reason = resolve_finish_reason(finish_reason, tool_calls)
         return ChatResponse(
-            content=content if isinstance(content, str) else str(content),
+            content=content,
             reasoning=reasoning,
+            tool_calls=tool_calls,
             finish_reason=finish_reason,
             model=data.get("model") or self.config.name,
             usage=parse_usage_openai_chat(data.get("usage")),
@@ -107,6 +194,9 @@ class OpenAICompletionsAdapter(ProtocolAdapter):
         last_model: str | None = None
         last_usage = None
         last_finish = None
+        # index -> partial tool call aggregation
+        pending: dict[int, dict[str, str]] = {}
+        stream_truncated = False
         try:
             for data_line in iter_sse_data_lines(lines):
                 payload = parse_json_object(data_line)
@@ -125,9 +215,58 @@ class OpenAICompletionsAdapter(ProtocolAdapter):
                     text = delta.get("content")
                     if text:
                         yield StreamChunk(type="content", delta=str(text))
+                    for tc in delta.get("tool_calls") or []:
+                        if not isinstance(tc, dict):
+                            continue
+                        idx = int(tc.get("index") or 0)
+                        slot = pending.setdefault(
+                            idx, {"id": "", "name": "", "arguments": ""}
+                        )
+                        if tc.get("id"):
+                            slot["id"] = str(tc["id"])
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            slot["name"] = str(fn["name"])
+                        if fn.get("arguments"):
+                            slot["arguments"] += str(fn["arguments"])
                     fr = map_finish_reason(choice.get("finish_reason"))
                     if fr is not None:
                         last_finish = fr
+                        if fr == "length":
+                            stream_truncated = True
+            tool_calls: list[ToolCall] | None = None
+            if pending:
+                calls: list[ToolCall] = []
+                for idx in sorted(pending):
+                    slot = pending[idx]
+                    truncated = stream_truncated and last_finish == "length"
+                    # If finish is length, mark incomplete when args not parseable
+                    call = build_tool_call(
+                        id=slot["id"],
+                        name=slot["name"],
+                        arguments_raw=slot["arguments"],
+                        truncated=False,
+                    )
+                    if truncated and call.arguments is None:
+                        call = build_tool_call(
+                            id=slot["id"],
+                            name=slot["name"],
+                            arguments_raw=slot["arguments"],
+                            truncated=True,
+                        )
+                    elif truncated:
+                        # length finish with parseable args still complete if id/name ok
+                        pass
+                    if not slot["id"] or not slot["name"]:
+                        call = build_tool_call(
+                            id=slot["id"],
+                            name=slot["name"],
+                            arguments_raw=slot["arguments"],
+                            truncated=True,
+                        )
+                    calls.append(call)
+                tool_calls = normalize_tool_calls(calls)
+            last_finish = resolve_finish_reason(last_finish, tool_calls)
             saw_finish = True
             yield StreamChunk(
                 type="finish",
@@ -135,6 +274,7 @@ class OpenAICompletionsAdapter(ProtocolAdapter):
                 finish_reason=last_finish,
                 model=last_model or self.config.name,
                 usage=last_usage,
+                tool_calls=tool_calls,
             )
         except LLMError:
             raise
@@ -146,7 +286,6 @@ class OpenAICompletionsAdapter(ProtocolAdapter):
             ) from exc
         finally:
             if not saw_finish:
-                # mid-stream failure: do not emit finish (caller handles Error)
                 pass
 
     def chat_stream(self, request: ChatRequest) -> Iterator[StreamChunk]:
@@ -170,7 +309,6 @@ class OpenAICompletionsAdapter(ProtocolAdapter):
             async for line in lines:
                 yield line
 
-        # Buffer async lines into sync iterator via list for reuse of parser
         collected: list[str] = []
         async for line in _agen():
             collected.append(line)

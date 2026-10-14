@@ -34,6 +34,9 @@ def map_finish_reason(raw: str | None) -> FinishReason | None:
         "max_output_tokens": "length",
         "content_filter": "content_filter",
         "content_filtered": "content_filter",
+        "tool_calls": "tool_calls",
+        "tool_use": "tool_calls",
+        "function_call": "tool_calls",
     }
     return mapping.get(value)  # type: ignore[return-value]
 

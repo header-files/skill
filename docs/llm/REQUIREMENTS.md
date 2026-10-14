@@ -2,7 +2,7 @@
 
 ## 目标
 
-实现可扩展的大模型调用能力：自研 HTTP 层、统一抽象、多模型配置、可配置日志、CLI 对话。
+实现可扩展的大模型调用能力：自研 HTTP 层、统一抽象、多模型配置、可配置日志、CLI 对话、Tool Calling。
 
 ## 功能需求
 
@@ -15,10 +15,12 @@
 7. CLI 客户端，拼接多轮上下文；无前端
 8. 响应侧支持 Reasoning 文本事件流
 9. 上游错误归一为统一 Error
-10. 保留文档（人读 README + agent 可读 docs）
-11. 开发过程编写单元测试
+10. Tool Calling：统一 ToolSpec / ToolCall；三协议非流式与流式；出站校验与工具轮次配对
+11. 保留文档（人读 README + agent 可读 docs）
+12. 开发过程编写单元测试
 
 ## 非目标（第一期）
 
-- 前端 / 对外 HTTP API 服务
-- Tool Calling、多模态
+- 前端 / 对外 HTTP API 服务（llm 域本身）
+- 多模态
+- 自动执行工具的 Agent 循环（由上层如 Skill Runtime 负责）

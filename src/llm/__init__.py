@@ -3,7 +3,15 @@
 from llm.client import LLMClient
 from llm.errors import LLMError
 from llm.session import ChatSession
-from llm.types import ChatRequest, ChatResponse, Message, StreamChunk, Usage
+from llm.types import (
+    ChatRequest,
+    ChatResponse,
+    Message,
+    StreamChunk,
+    ToolCall,
+    ToolSpec,
+    Usage,
+)
 
 __all__ = [
     "LLMClient",
@@ -13,5 +21,7 @@ __all__ = [
     "ChatResponse",
     "Message",
     "StreamChunk",
+    "ToolCall",
+    "ToolSpec",
     "Usage",
 ]

@@ -13,6 +13,7 @@
 ```text
 type: auth_error | api_error | timeout_error
     | network_error | stream_error | unsupported_parameter
+    | invalid_request
 message: string
 status_code: int | null
 provider_code: string | null
@@ -31,6 +32,7 @@ retryable: bool | null
 | 连接失败 | network_error |
 | 流中断/解析失败 | stream_error |
 | 可识别参数不支持 | unsupported_parameter |
+| 本地请求非法（tools/消息/工具轮次配对等） | invalid_request |
 | 其他上游错误 | api_error |
 
 `message` 优先取厂商错误文案；不回显 API Key。

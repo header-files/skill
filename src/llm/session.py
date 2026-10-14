@@ -80,12 +80,20 @@ class ChatSession:
                 exc,
             )
             raise
-        self.messages.append(Message(role="assistant", content=response.content))
+        self.messages.append(
+            Message(
+                role="assistant",
+                content=response.content,
+                tool_calls=response.tool_calls,
+            )
+        )
         log.info(
-            "Session turn success model_id=%s messages=%d finish_reason=%s",
+            "Session turn success model_id=%s messages=%d finish_reason=%s "
+            "tool_calls_count=%d",
             model_id,
             len(self.messages),
             response.finish_reason,
+            len(response.tool_calls) if response.tool_calls else 0,
         )
         return response
 
@@ -96,6 +104,7 @@ class ChatSession:
         content_parts: list[str] = []
         finished = False
         finish_reason = None
+        finish_tool_calls = None
         log.info(
             "Session turn start model_id=%s messages=%d stream=true",
             model_id,
@@ -108,10 +117,15 @@ class ChatSession:
                 if chunk.type == "finish":
                     finished = True
                     finish_reason = chunk.finish_reason
+                    finish_tool_calls = chunk.tool_calls
                 yield chunk
             if finished:
                 self.messages.append(
-                    Message(role="assistant", content="".join(content_parts))
+                    Message(
+                        role="assistant",
+                        content="".join(content_parts),
+                        tool_calls=finish_tool_calls,
+                    )
                 )
                 log.info(
                     "Session turn success model_id=%s messages=%d "
