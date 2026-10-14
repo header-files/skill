@@ -219,6 +219,22 @@ RAG_SYSTEM_PROMPT=
 
 ---
 
+## Skill Runtime（`SKILL_*`）
+
+| 配置项 | 默认 | 必填 | 说明 | 校验 |
+|--------|------|------|------|------|
+| `SKILL_ROOTS` | 空 | 否 | Skill 根目录列表 | 用 `:` 分隔；每个根下一层子目录为候选 Skill |
+| `SKILL_CHAT_MODEL` | 空 → `DEFAULT_MODEL` | 否 | 执行 Skill 所用对话模型 id | 须为已配置的 `MODEL_*` |
+| `SKILL_FINGERPRINT_MODE` | `content` | 否 | 目录指纹模式 | `content`（默认，内容哈希）或 `meta`（有漏检风险） |
+| `SKILL_SCRIPT_TIMEOUT_SECONDS` | `30` | 否 | 单脚本超时 | `>= 0.1` |
+| `SKILL_SCRIPT_MAX_CONCURRENT` | `4` | 否 | 全局脚本并发上限 | `>= 1` |
+| `SKILL_SCRIPT_MAX_OUTPUT_BYTES` | `1048576` | 否 | stdout+stderr 合计缓冲上限 | `>= 1` |
+| `SKILL_AGENT_MAX_STEPS` | `20` | 否 | Agent 最大步数 | `>= 1` |
+| `SKILL_AGENT_TIMEOUT_SECONDS` | `300` | 否 | 整次 run 超时 | `>= 0.1` |
+| `SKILL_READ_MAX_BYTES` | `1048576` | 否 | `read_resource` 上限 | `>= 1` |
+
+---
+
 ## 公共 HTTP（`API_*`）
 
 供 `rag serve` 监听与 CLI 默认连址。

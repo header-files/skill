@@ -9,6 +9,7 @@ from common.config.log_settings import LogSettings, load_log_settings
 from common.config.models import ModelConfig, get_model, load_models
 from common.config.rag import RagSettings, load_rag_settings
 from common.config.rerank import get_reranker, load_rerankers
+from common.config.skill import SkillSettings, load_skill_settings
 
 __all__ = [
     "ApiSettings",
@@ -17,6 +18,7 @@ __all__ = [
     "LogSettings",
     "ModelConfig",
     "RagSettings",
+    "SkillSettings",
     "get_embedding",
     "get_model",
     "get_reranker",
@@ -27,4 +29,5 @@ __all__ = [
     "load_models",
     "load_rag_settings",
     "load_rerankers",
+    "load_skill_settings",
 ]
